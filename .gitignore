@@ -12,3 +12,7 @@ result*
 # IDEs
 .vscode/
 .idea/
+
+# Workspace
+stage.md
+.claude/
