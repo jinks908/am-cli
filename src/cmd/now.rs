@@ -7,9 +7,8 @@ use crate::{
     music::{self, PlayerState, Playlist, Track},
 };
 
-use anstream::println;
 use clap::Parser;
-use crossterm::{cursor, execute, terminal};
+use crossterm::{cursor, execute, queue, terminal};
 use eyre::{Result, eyre};
 use owo_colors::OwoColorize as _;
 
@@ -18,6 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
+    signal,
     sync::{mpsc, watch},
     task,
 };
@@ -152,24 +152,15 @@ fn make_bar(n: f64, width: Option<i32>) -> Result<String> {
 
 #[expect(clippy::unused_async, clippy::cast_possible_truncation)]
 async fn update_display(data: &PlaybackState, options: &NowOptions) -> Result<()> {
-    if options.watch {
-        execute!(
-            stdout(),
-            cursor::RestorePosition,
-            terminal::Clear(terminal::ClearType::FromCursorDown),
-        )?;
-    }
+    let mut lines = Vec::new();
 
     if data.state == PlayerState::Stopped {
-        println!("Playback is {}", data.state.red());
+        lines.push(format!("Playback is {}", data.state.red()));
     } else if let Some(position) = &data.position
         && let Some(track) = &data.track
     {
-        let mut stdout = anstream::stdout().lock();
-
-        writeln!(stdout, "{}", track.name.bold())?;
-        writeln!(
-            stdout,
+        lines.push(track.name.bold().to_string());
+        lines.push(format!(
             "{} {} {} {}",
             if options.no_nerd_fonts {
                 data.state.to_string()
@@ -179,29 +170,50 @@ async fn update_display(data: &PlaybackState, options: &NowOptions) -> Result<()
             format::format_duration(*position as i32, false),
             make_bar(position / track.duration, options.bar_width)?,
             format::format_duration(track.duration as i32, true),
-        )?;
-        writeln!(
-            stdout,
+        ));
+        lines.push(format!(
             "{} · {}",
             track.artist.blue(),
             track.album.magenta()
-        )?;
+        ));
 
         if let Some(playlist) = &data.playlist {
-            writeln!(
-                stdout,
-                "{}",
+            lines.push(
                 format!(
                     "Playlist: {} ({})",
                     playlist.name,
                     format::format_duration_plain(playlist.duration)
                 )
                 .dimmed()
-            )?;
+                .to_string(),
+            );
         }
-
-        stdout.flush()?;
+    } else {
+        return Ok(());
     }
+
+    // Build the whole frame first and write it once, so the terminal never shows a partial frame
+    let mut frame = Vec::new();
+
+    if options.watch {
+        queue!(frame, cursor::MoveTo(0, 0))?;
+    }
+
+    for line in &lines {
+        frame.write_all(line.as_bytes())?;
+        if options.watch {
+            queue!(frame, terminal::Clear(terminal::ClearType::UntilNewLine))?;
+        }
+        frame.write_all(b"\n")?;
+    }
+
+    if options.watch {
+        queue!(frame, terminal::Clear(terminal::ClearType::FromCursorDown))?;
+    }
+
+    let mut stdout = anstream::stdout().lock();
+    stdout.write_all(&frame)?;
+    stdout.flush()?;
 
     Ok(())
 }
@@ -263,7 +275,7 @@ pub async fn now(options: NowOptions) -> Result<()> {
     let watch = options.watch;
 
     if watch {
-        execute!(stdout(), cursor::SavePosition)?;
+        execute!(stdout(), terminal::EnterAlternateScreen, cursor::Hide)?;
     }
 
     let (tx, mut rx) = mpsc::channel::<PlaybackStateDelta>(20);
@@ -272,6 +284,17 @@ pub async fn now(options: NowOptions) -> Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(());
 
     let mut tasks = task::JoinSet::<Result<()>>::new();
+
+    // Watch mode only ends on Ctrl-C; shut down the tasks so the terminal can be restored below
+    if watch {
+        let shutdown_tx = shutdown_tx.clone();
+
+        tasks.spawn(async move {
+            signal::ctrl_c().await?;
+            let _ = shutdown_tx.send(());
+            Ok(())
+        });
+    }
 
     tasks.spawn({
         let tx = tx.clone();
@@ -351,6 +374,10 @@ pub async fn now(options: NowOptions) -> Result<()> {
         .await
         .into_iter()
         .collect::<Result<Vec<_>>>();
+
+    if watch {
+        execute!(stdout(), cursor::Show, terminal::LeaveAlternateScreen)?;
+    }
 
     Ok(())
 }
